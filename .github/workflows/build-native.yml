@@ -1,0 +1,72 @@
+name: Build Native Android APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_id:
+        required: true
+      app_name:
+        required: true
+      package_name:
+        required: true
+      build_type:
+        required: true
+      source_url:
+        required: true
+      callback_url:
+        required: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download source project
+        run: |
+          curl -sSL -f -o source.zip "${{ inputs.source_url }}" || { echo "::error::Gagal download source project"; exit 1; }
+          mkdir project
+          unzip -q source.zip -d project
+          INNER=$(find project -mindepth 1 -maxdepth 1 -type d | head -n 1)
+          if [ "$(find project -mindepth 1 -maxdepth 1 | wc -l)" -eq 1 ] && [ -n "$INNER" ]; then
+            mv "$INNER"/* project/ 2>/dev/null || true
+          fi
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Grant execute permission for gradlew
+        working-directory: project
+        run: chmod +x gradlew || true
+
+      - name: Build APK (${{ inputs.build_type }})
+        working-directory: project
+        run: |
+          if [ "${{ inputs.build_type }}" = "release" ]; then
+            ./gradlew assembleRelease --no-daemon
+            APK=$(find app/build/outputs/apk/release -name "*.apk" | head -n 1)
+          else
+            ./gradlew assembleDebug --no-daemon
+            APK=$(find app/build/outputs/apk/debug -name "*.apk" | head -n 1)
+          fi
+          if [ -z "$APK" ]; then echo "::error::APK tidak ditemukan setelah build"; exit 1; fi
+          echo "APK_PATH=project/$APK" >> $GITHUB_ENV
+
+      - name: Send APK back to bot
+        if: success()
+        run: |
+          curl -sS -f -X POST "${{ inputs.callback_url }}/api/build-result" \
+            -H "X-Callback-Token: ${{ secrets.CALLBACK_SECRET }}" \
+            -F "build_id=${{ inputs.build_id }}" \
+            -F "status=success" \
+            -F "file=@${{ env.APK_PATH }}"
+
+      - name: Report failure to bot
+        if: failure()
+        run: |
+          curl -sS -X POST "${{ inputs.callback_url }}/api/build-result" \
+            -H "X-Callback-Token: ${{ secrets.CALLBACK_SECRET }}" \
+            -F "build_id=${{ inputs.build_id }}" \
+            -F "status=failed" \
+            -F "error_log=Build gagal. Cek Actions log run #${{ github.run_id }} untuk detail."
