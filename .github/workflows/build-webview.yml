@@ -1,0 +1,246 @@
+name: Build Webview APK (HTML to APK)
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_id:
+        required: true
+      app_name:
+        required: true
+      package_name:
+        required: true
+      build_type:
+        description: 'debug atau release'
+        required: true
+      mode:
+        description: 'url atau html'
+        required: true
+      target_url:
+        description: 'URL website (dipakai kalau mode=url)'
+        required: false
+      source_url:
+        description: 'URL download zip HTML (dipakai kalau mode=html)'
+        required: false
+      callback_url:
+        required: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # Input mentah dari user (app_name, target_url) TIDAK PERNAH disisipkan langsung
+    # ke dalam skrip `run:` di bawah -- semua lewat env var supaya aman dari
+    # GitHub Actions script-injection (lihat: docs.github.com/actions/security-guides).
+    env:
+      APP_NAME: ${{ inputs.app_name }}
+      PACKAGE_NAME: ${{ inputs.package_name }}
+      TARGET_URL: ${{ inputs.target_url }}
+    steps:
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+          cache: true
+
+      - name: Scaffold Flutter project
+        run: flutter create --org com.web2apk --project-name webview_app project
+
+      - name: Add webview_flutter dependency
+        working-directory: project
+        run: flutter pub add webview_flutter
+
+      - name: Download HTML source (mode=html)
+        if: inputs.mode == 'html'
+        run: |
+          mkdir -p project/assets/www
+          curl -sSL -f -o html.zip "${{ inputs.source_url }}" || { echo "::error::Gagal download source HTML"; exit 1; }
+          unzip -q html.zip -d project/assets/www
+          INNER=$(find project/assets/www -mindepth 1 -maxdepth 1 -type d | head -n 1)
+          if [ "$(find project/assets/www -mindepth 1 -maxdepth 1 | wc -l)" -eq 1 ] && [ -n "$INNER" ]; then
+            mv "$INNER"/* project/assets/www/ 2>/dev/null || true
+          fi
+          if [ ! -f project/assets/www/index.html ]; then
+            echo "::error::index.html tidak ditemukan di root zip HTML"; exit 1
+          fi
+
+      - name: Daftarkan folder assets di pubspec.yaml (mode=html)
+        if: inputs.mode == 'html'
+        working-directory: project
+        run: |
+          sed -i '/uses-material-design: true/a\  assets:\n    - assets/www/' pubspec.yaml
+
+      - name: Tulis lib/main.dart (mode=html, load dari asset lokal)
+        if: inputs.mode == 'html'
+        working-directory: project
+        run: |
+          cat > lib/main.dart <<'DARTEOF'
+          import 'package:flutter/material.dart';
+          import 'package:webview_flutter/webview_flutter.dart';
+
+          void main() => runApp(const MyApp());
+
+          class MyApp extends StatelessWidget {
+            const MyApp({super.key});
+            @override
+            Widget build(BuildContext context) => const MaterialApp(
+                  debugShowCheckedModeBanner: false,
+                  home: WebViewPage(),
+                );
+          }
+
+          class WebViewPage extends StatefulWidget {
+            const WebViewPage({super.key});
+            @override
+            State<WebViewPage> createState() => _WebViewPageState();
+          }
+
+          class _WebViewPageState extends State<WebViewPage> {
+            late final WebViewController _controller;
+
+            @override
+            void initState() {
+              super.initState();
+              _controller = WebViewController()
+                ..setJavaScriptMode(JavaScriptMode.unrestricted)
+                ..loadFlutterAsset('assets/www/index.html');
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              return Scaffold(
+                body: SafeArea(
+                  child: PopScope(
+                    canPop: false,
+                    onPopInvokedWithResult: (didPop, result) async {
+                      if (didPop) return;
+                      if (await _controller.canGoBack()) {
+                        _controller.goBack();
+                      }
+                    },
+                    child: WebViewWidget(controller: _controller),
+                  ),
+                ),
+              );
+            }
+          }
+          DARTEOF
+
+      - name: Tulis lib/main.dart (mode=url, load dari website)
+        if: inputs.mode == 'url'
+        working-directory: project
+        run: |
+          cat > lib/main.dart <<'DARTEOF'
+          import 'package:flutter/material.dart';
+          import 'package:webview_flutter/webview_flutter.dart';
+          import 'target_url.dart';
+
+          void main() => runApp(const MyApp());
+
+          class MyApp extends StatelessWidget {
+            const MyApp({super.key});
+            @override
+            Widget build(BuildContext context) => const MaterialApp(
+                  debugShowCheckedModeBanner: false,
+                  home: WebViewPage(),
+                );
+          }
+
+          class WebViewPage extends StatefulWidget {
+            const WebViewPage({super.key});
+            @override
+            State<WebViewPage> createState() => _WebViewPageState();
+          }
+
+          class _WebViewPageState extends State<WebViewPage> {
+            late final WebViewController _controller;
+
+            @override
+            void initState() {
+              super.initState();
+              _controller = WebViewController()
+                ..setJavaScriptMode(JavaScriptMode.unrestricted)
+                ..loadRequest(Uri.parse(kTargetUrl));
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              return Scaffold(
+                body: SafeArea(
+                  child: PopScope(
+                    canPop: false,
+                    onPopInvokedWithResult: (didPop, result) async {
+                      if (didPop) return;
+                      if (await _controller.canGoBack()) {
+                        _controller.goBack();
+                      }
+                    },
+                    child: WebViewWidget(controller: _controller),
+                  ),
+                ),
+              );
+            }
+          }
+          DARTEOF
+          # kTargetUrl ditulis lewat Node (baca dari process.env, BUKAN interpolasi shell)
+          # supaya aman dari karakter apapun yang diketik user sebagai URL.
+          node -e "
+            const fs = require('fs');
+            const url = process.env.TARGET_URL || '';
+            fs.writeFileSync('lib/target_url.dart', 'const String kTargetUrl = ' + JSON.stringify(url) + ';\n');
+          "
+
+      - name: Set nama & package aplikasi
+        working-directory: project
+        run: |
+          node -e "
+            const fs = require('fs');
+            const p = 'android/app/src/main/AndroidManifest.xml';
+            let xml = fs.readFileSync(p, 'utf8');
+            const appName = (process.env.APP_NAME || 'Web2APK App').replace(/[\"<>]/g, '');
+            xml = xml.replace('android:label=\"webview_app\"', 'android:label=\"' + appName + '\"');
+            fs.writeFileSync(p, xml);
+          "
+          if [ -f android/app/build.gradle ]; then
+            sed -i "s/applicationId \".*\"/applicationId \"$PACKAGE_NAME\"/" android/app/build.gradle || true
+          fi
+          if [ -f android/app/build.gradle.kts ]; then
+            sed -i "s/applicationId = \".*\"/applicationId = \"$PACKAGE_NAME\"/" android/app/build.gradle.kts || true
+          fi
+
+      - name: Flutter pub get
+        working-directory: project
+        run: flutter pub get
+
+      - name: Build APK (${{ inputs.build_type }})
+        working-directory: project
+        run: |
+          if [ "${{ inputs.build_type }}" = "release" ]; then
+            flutter build apk --release
+            echo "APK_PATH=project/build/app/outputs/flutter-apk/app-release.apk" >> $GITHUB_ENV
+          else
+            flutter build apk --debug
+            echo "APK_PATH=project/build/app/outputs/flutter-apk/app-debug.apk" >> $GITHUB_ENV
+          fi
+
+      - name: Send APK back to bot
+        if: success()
+        run: |
+          curl -sS -f -X POST "${{ inputs.callback_url }}/api/build-result" \
+            -H "X-Callback-Token: ${{ secrets.CALLBACK_SECRET }}" \
+            -F "build_id=${{ inputs.build_id }}" \
+            -F "status=success" \
+            -F "file=@${{ env.APK_PATH }}"
+
+      - name: Report failure to bot
+        if: failure()
+        run: |
+          curl -sS -X POST "${{ inputs.callback_url }}/api/build-result" \
+            -H "X-Callback-Token: ${{ secrets.CALLBACK_SECRET }}" \
+            -F "build_id=${{ inputs.build_id }}" \
+            -F "status=failed" \
+            -F "error_log=Build gagal. Cek Actions log run #${{ github.run_id }} untuk detail."
